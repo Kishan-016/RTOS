@@ -52,7 +52,7 @@ int main(int argc, char *argv[])
           fgets(buff,255,stdin);
           n = write(new_sockfd,buff,strlen(buff));
            if (n < 0) error("error writing to the socket");
-           int i=strncmp("Bye Bye" , buff, 7);
+           int i=strncmp("See You" , buff, 7);
            if(i == 0)
                break;
      }
