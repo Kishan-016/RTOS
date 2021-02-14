@@ -1,230 +1,176 @@
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
 #include <string.h>
-#include <pthread.h>
+#include <sys/socket.h>
 #include <sys/types.h>
-#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-#define MAX_CLIENTS 100
-#define BUFFER_SZ 2048
+#define NO_GROUPS_MAX 5
+#define BUFFER_SIZE 1024
+#define GROUP_NAME_MAX 20
+#define NO_CLIENTS_MAX 100
 
-static _Atomic unsigned int cli_count = 0;
-static int uid = 10;
+int fd;    // socket descripter
+int conn;  // connection descripter
+int connections[NO_GROUPS_MAX][NO_CLIENTS_MAX];
+char group_names[NO_GROUPS_MAX][GROUP_NAME_MAX];
+int connections_Count[NO_GROUPS_MAX];
+int group_count = 0;
 
-/* Client structure */
-typedef struct{
-	struct sockaddr_in address;
-	int sockfd;
-	int uid;
-	char name[32];
-} client_t;
+pthread_mutex_t newConnectionLock = PTHREAD_MUTEX_INITIALIZER;
 
-client_t *clients[MAX_CLIENTS];
+struct JoinRequest {
+    char groupName[20];
+    char name[20];
+};
 
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct JoinResponse {
+    int id;
+    int groupId;
+};
 
-void str_overwrite_stdout() {
-    printf("\r%s", "> ");
-    fflush(stdout);
-}
-
-void str_trim_lf (char* arr, int length) {
-  int i;
-  for (i = 0; i < length; i++) { // trim \n
-    if (arr[i] == '\n') {
-      arr[i] = '\0';
-      break;
+struct Message {
+    int id;
+    int groupId;
+    char name[20];
+    char message[200];
+};
+void closeServer() {
+    printf(
+        "Are you sure you want to close the server ? All groups will be "
+        "deleted (Y/N) \n");
+    char response;
+    scanf("%c", &response);
+    if (response == 'Y' || response == 'y') {
+        printf("Closing Server\n");
+        for (int i = 0; i < group_count; i++) {
+            for (int j = 0; j < connections_Count[i]; j++) {
+                close(connections[i][j]);
+            }
+        }
+        close(fd);
+        exit(EXIT_SUCCESS);
     }
-  }
 }
 
-void print_client_addr(struct sockaddr_in addr){
-    printf("%d.%d.%d.%d",
-        addr.sin_addr.s_addr & 0xff,
-        (addr.sin_addr.s_addr & 0xff00) >> 8,
-        (addr.sin_addr.s_addr & 0xff0000) >> 16,
-        (addr.sin_addr.s_addr & 0xff000000) >> 24);
+void handle_my(int sig) {
+    switch (sig) {
+        case SIGINT:
+            closeServer();
+            break;
+    }
 }
 
-/* Add clients to queue */
-void queue_add(client_t *cl){
-	pthread_mutex_lock(&clients_mutex);
+struct sockaddr_in serv;  // socket variable
 
-	for(int i=0; i < MAX_CLIENTS; ++i){
-		if(!clients[i]){
-			clients[i] = cl;
-			break;
-		}
-	}
+void *connection_handler(void *connec) {
+    int nsd = *(int *)connec;
 
-	pthread_mutex_unlock(&clients_mutex);
+    struct JoinRequest request;
+    struct JoinResponse response;
+    read(nsd, &request, sizeof(request));  // reads incoming client requests.
+    char *name = request.name;
+    char *groupname = request.groupName;
+    printf("%s\n", name);
+    printf("%s\n", groupname);
+
+    int flag = 1;
+    int groupId;
+    int id;
+
+    pthread_mutex_lock(&newConnectionLock);
+    for (int i = 0; i < group_count; i++) {
+        // if same group name already exists, add the client
+        // to the same group and assign the group id and an id to the client.
+        if (!strcmp(groupname, group_names[i])) {
+            groupId = i;
+            id = connections_Count[i]++;
+            connections[groupId][id] = nsd;
+            flag = 0;
+            break;
+        }
+    }
+    // if the group name doesnt exist, create a new group with
+    // the given name.
+    if (flag) {
+        int i = group_count++;
+        strcpy(group_names[i], request.groupName);
+        groupId = i;
+        id = connections_Count[i]++;
+        connections[groupId][id] = nsd;
+    }
+    pthread_mutex_unlock(&newConnectionLock);
+    response.id = id;
+    response.groupId = groupId;
+
+    write(nsd, &response, sizeof(response));
+    struct Message message;
+    while (read(nsd, &message, sizeof(message))) {
+      printf("%s\n", message.message);
+      printf("%d\n", message.id);
+        for (int i = 0; i < connections_Count[groupId]; i++) {
+            if (~connections[groupId][i] && i != message.id) {
+                write(connections[groupId][i], &message, sizeof(message));
+            }
+        }
+    }
+    connections[groupId][id] = -1;
+    return NULL;
 }
 
-/* Remove clients to queue */
-void queue_remove(int uid){
-	pthread_mutex_lock(&clients_mutex);
+// main function:
+int main(int argc, char *argv[]) {
+    int fd, new_socket, valread;
+    struct sockaddr_in serv, client;
 
-	for(int i=0; i < MAX_CLIENTS; ++i){
-		if(clients[i]){
-			if(clients[i]->uid == uid){
-				clients[i] = NULL;
-				break;
-			}
-		}
-	}
+    int addrlen = sizeof(serv);
 
-	pthread_mutex_unlock(&clients_mutex);
-}
+    pthread_t thread;
+    // opening socket
+    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+    signal(SIGINT, handle_my);
+    socklen_t clientLen;
+    printf("socket created\n");
+    int port_no = atoi(argv[1]);
+    printf("%d\n", port_no);
+    serv.sin_family = AF_INET;
+    serv.sin_port =
+        htons(port_no);  // port at which server will listen for connections
+    serv.sin_addr.s_addr = INADDR_ANY;
 
-/* Send message to all clients except sender */
-void send_message(char *s, int uid){
-	pthread_mutex_lock(&clients_mutex);
+    int true = 1;
+    // setsockopt(fd,SOL_SOCKET,SO_REUSEAADR, &true, sizeof(int));
 
-	for(int i=0; i<MAX_CLIENTS; ++i){
-		if(clients[i]){
-			if(clients[i]->uid != uid){
-				if(write(clients[i]->sockfd, s, strlen(s)) < 0){
-					perror("ERROR: write to descriptor failed");
-					break;
-				}
-			}
-		}
-	}
+    if (bind(fd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
 
-	pthread_mutex_unlock(&clients_mutex);
-}
-
-/* Handle all communication with the client */
-void *handle_client(void *arg){
-	char buff_out[BUFFER_SZ];
-	char name[32];
-	int leave_flag = 0;
-
-	cli_count++;
-	client_t *cli = (client_t *)arg;
-
-	// Name
-	if(recv(cli->sockfd, name, 32, 0) <= 0 || strlen(name) <  2 || strlen(name) >= 32-1){
-		printf("Didn't enter the name.\n");
-		leave_flag = 1;
-	} else{
-		strcpy(cli->name, name);
-		sprintf(buff_out, "%s has joined\n", cli->name);
-		printf("%s", buff_out);
-		send_message(buff_out, cli->uid);
-	}
-
-	bzero(buff_out, BUFFER_SZ);
-
-	while(1){
-		if (leave_flag) {
-			break;
-		}
-
-		int receive = recv(cli->sockfd, buff_out, BUFFER_SZ, 0);
-		if (receive > 0){
-			if(strlen(buff_out) > 0){
-				send_message(buff_out, cli->uid);
-
-				str_trim_lf(buff_out, strlen(buff_out));
-				printf("%s -> %s\n", buff_out, cli->name);
-			}
-		} else if (receive == 0 || strcmp(buff_out, "exit") == 0){
-			sprintf(buff_out, "%s has left\n", cli->name);
-			printf("%s", buff_out);
-			send_message(buff_out, cli->uid);
-			leave_flag = 1;
-		} else {
-			printf("ERROR: -1\n");
-			leave_flag = 1;
-		}
-
-		bzero(buff_out, BUFFER_SZ);
-	}
-
-  /* Delete client from queue and yield thread */
-	close(cli->sockfd);
-  queue_remove(cli->uid);
-  free(cli);
-  cli_count--;
-  pthread_detach(pthread_self());
-
-	return NULL;
-}
-
-int main(int argc, char **argv){
-	if(argc != 2){
-		printf("Usage: %s <port>\n", argv[0]);
-		return EXIT_FAILURE;
-	}
-
-	char *ip = "127.0.0.1";
-	int port = atoi(argv[1]);
-	int option = 1;
-	int listenfd = 0, connfd = 0;
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in cli_addr;
-  pthread_t tid;
-
-  /* Socket settings */
-  listenfd = socket(AF_INET, SOCK_STREAM, 0);
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = inet_addr(ip);
-  serv_addr.sin_port = htons(port);
-
-  /* Ignore pipe signals */
-	signal(SIGPIPE, SIG_IGN);
-
-	if(setsockopt(listenfd, SOL_SOCKET,(SO_REUSEPORT | SO_REUSEADDR),(char*)&option,sizeof(option)) < 0){
-		perror("ERROR: setsockopt failed");
-    return EXIT_FAILURE;
-	}
-
-	/* Bind */
-  if(bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-    perror("ERROR: Socket binding failed");
-    return EXIT_FAILURE;
-  }
-
-  /* Listen */
-  if (listen(listenfd, 10) < 0) {
-    perror("ERROR: Socket listening failed");
-    return EXIT_FAILURE;
-	}
-
-	printf("=== WELCOME TO THE CHATROOM ===\n");
-
-	while(1){
-		socklen_t clilen = sizeof(cli_addr);
-		connfd = accept(listenfd, (struct sockaddr*)&cli_addr, &clilen);
-
-		/* Check if max clients is reached */
-		if((cli_count + 1) == MAX_CLIENTS){
-			printf("Max clients reached. Rejected: ");
-			print_client_addr(cli_addr);
-			printf(":%d\n", cli_addr.sin_port);
-			close(connfd);
-			continue;
-		}
-
-		/* Client settings */
-		client_t *cli = (client_t *)malloc(sizeof(client_t));
-		cli->address = cli_addr;
-		cli->sockfd = connfd;
-		cli->uid = uid++;
-
-		/* Add client to the queue and fork thread */
-		queue_add(cli);
-		pthread_create(&tid, NULL, &handle_client, (void*)cli);
-
-		/* Reduce CPU usage */
-		sleep(1);
-	}
-
-	return EXIT_SUCCESS;
+    if (listen(fd, 3) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+    clientLen = sizeof(client);
+    while (1) {
+        printf("entered loop\n");
+        conn = accept(fd, (struct sockaddr *)&serv, (socklen_t *)&addrlen);
+        printf("%d\n", conn);
+        if (pthread_create(&thread, NULL, connection_handler, (void *)&conn) <
+            0) {
+            perror("thread not created");
+            exit(0);
+        }
+    }
+    pthread_exit(NULL);
+    close(fd);
+    return 0;
 }
