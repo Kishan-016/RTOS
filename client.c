@@ -1,140 +1,133 @@
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <signal.h>
 
-#define LENGTH 2048
+// struct for requests to join group.
+// used by client to tell the server which group it wants to join.
 
-// Global variables
-volatile sig_atomic_t flag = 0;
-int sockfd = 0;
-char name[32];
+struct JoinRequest {
+    char groupName[20];
+    char name[20];
+};
+// once the server accepts the client's request, it returns with the
+// id of the client and the group id it assigned to it.
+struct JoinResponse {
+    int id;
+    int groupId;
+};
+// once groups are assigned, there is normal chat exchange happening.
+// this is done by sending the following msg sequence.
+struct Message {
+    int id;
+    int groupId;
+    char name[20];
+    char message[200];
+};
 
-void str_overwrite_stdout() {
-  printf("%s", "> ");
-  fflush(stdout);
-}
-
-void str_trim_lf (char* arr, int length) {
-  int i;
-  for (i = 0; i < length; i++) { // trim \n
-    if (arr[i] == '\n') {
-      arr[i] = '\0';
-      break;
-    }
-  }
-}
-
-void catch_ctrl_c_and_exit(int sig) {
-    flag = 1;
-}
-
-void send_msg_handler() {
-  char message[LENGTH] = {};
-	char buffer[LENGTH + 32] = {};
-
-  while(1) {
-  	str_overwrite_stdout();
-    fgets(message, LENGTH, stdin);
-    str_trim_lf(message, LENGTH);
-
-    if (strcmp(message, "exit") == 0) {
-			break;
-    } else {
-      sprintf(buffer, "%s: %s\n", name, message);
-      send(sockfd, buffer, strlen(buffer), 0);
+struct sockaddr_in serv;  // socket variable
+int fd;                   // socket descripter
+int conn;                 // connection descripter
+struct Message message;
+// send function
+void *send_func(void *n) {
+    int sd = *(int *)n;
+    while (1) {
+        printf("Enter message: ");
+        fgets(message.message, sizeof(message.message), stdin);
+        write(sd, &message, sizeof(message));
     }
 
-		bzero(message, LENGTH);
-    bzero(buffer, LENGTH + 32);
-  }
-  catch_ctrl_c_and_exit(2);
+    return 0;
 }
+// recieve function
+void *recv_func(void *n) {
+    int rsd = *(int *)n;
+    struct Message message;
 
-void recv_msg_handler() {
-	char message[LENGTH] = {};
-  while (1) {
-		int receive = recv(sockfd, message, LENGTH, 0);
-    if (receive > 0) {
-      printf("%s", message);
-      str_overwrite_stdout();
-    } else if (receive == 0) {
-			break;
-    } else {
-			// -1
-		}
-		memset(message, 0, sizeof(message));
-  }
-}
-
-int main(int argc, char **argv){
-	if(argc != 2){
-		printf("Usage: %s <port>\n", argv[0]);
-		return EXIT_FAILURE;
-	}
-
-	char *ip = "3.138.110.133";
-	int port = atoi(argv[1]);
-
-	signal(SIGINT, catch_ctrl_c_and_exit);
-
-	printf("Please enter your name: ");
-  fgets(name, 32, stdin);
-  str_trim_lf(name, strlen(name));
-
-
-	if (strlen(name) > 32 || strlen(name) < 2){
-		printf("Name must be less than 30 and more than 2 characters.\n");
-		return EXIT_FAILURE;
-	}
-
-	struct sockaddr_in server_addr;
-
-	/* Socket settings */
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = inet_addr(ip);
-  server_addr.sin_port = htons(port);
-
-
-  // Connect to Server
-  int err = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-  if (err == -1) {
-		printf("ERROR: connect\n");
-		return EXIT_FAILURE;
-	}
-
-	// Send name
-	send(sockfd, name, 32, 0);
-
-	printf("=== WELCOME TO THE CHATROOM ===\n");
-
-	pthread_t send_msg_thread;
-  if(pthread_create(&send_msg_thread, NULL, (void *) send_msg_handler, NULL) != 0){
-		printf("ERROR: pthread\n");
-    return EXIT_FAILURE;
-	}
-
-	pthread_t recv_msg_thread;
-  if(pthread_create(&recv_msg_thread, NULL, (void *) recv_msg_handler, NULL) != 0){
-		printf("ERROR: pthread\n");
-		return EXIT_FAILURE;
-	}
-
-	while (1){
-		if(flag){
-			printf("\nBye\n");
-			break;
+    while (read(rsd, &message, sizeof(message))) {
+        printf("%s: %s \n", message.name, message.message);
     }
-	}
 
-	close(sockfd);
+    return 0;
+}
+// signal handler for ctrl + C
+void signal_handler(int n) {
+    char ans;
+    exit(0);
 
-	return EXIT_SUCCESS;
+    if (n == SIGINT) {
+        printf("exit Y/N\n");
+        scanf("%c", &ans);
+        if (ans == 'y' || ans == 'Y') {
+            printf("The client exited gracefully\n");
+
+            exit(0);
+        }
+    }
+}
+// main function.
+int main(int argc, char const *argv[]) {
+    signal(SIGINT, signal_handler);  // to catch SIGINT and exit gracefully.
+    pthread_t thread;
+    // take from input argv
+    const char *clientname = argv[4];  // name of the client
+    printf("%s\n", clientname);
+    const char *clientgroup =
+        argv[5];  // group which the clien wants to add to.
+    printf("%s\n", clientgroup);
+    struct JoinRequest request;
+    strcpy(request.name, clientname);
+    strcpy(request.groupName, clientgroup);
+
+    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Socket creation error \n");
+        return -1;
+    }
+    printf("socket created\n");
+    // fd = socket(AF_INET, SOCK_STREAM, 0);
+    serv.sin_family = AF_INET;
+    int port_no = atoi(argv[3]);
+    printf("%d\n", port_no);
+    serv.sin_port = htons(port_no);
+    printf("%s\n", argv[2]);
+    if (inet_pton(AF_INET, argv[2], &serv.sin_addr) <= 0) {
+        printf("\nInvalid address/ Address not supported \n");
+        return -1;
+    }
+    // inet_pton(AF_INET, argv[2], &serv.sin_addr); //binding client to local
+    // host connect(fd, (struct sockaddr *)&serv, sizeof(serv));
+    if (connect(fd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        printf("\nConnection Failed \n");
+        return -1;
+    }
+
+    write(fd, &request, sizeof(request));
+    struct JoinResponse response;
+    read(fd, &response, sizeof(response));
+
+    int connectionId = response.id;
+    printf("connectionId = %d\n", connectionId);
+    int group_Id = response.groupId;
+    printf("%d %d\n", connectionId, group_Id);
+    if (pthread_create(&thread, NULL, recv_func, (void *)&fd) < 0) {
+        perror("pthread_create()");
+        exit(EXIT_FAILURE);
+    }
+    message.id = connectionId;
+    message.groupId = group_Id;
+    strcpy(message.name, clientname);
+
+    pthread_create(&thread, NULL, send_func, (void *)&fd);
+    pthread_join(thread, NULL);
+
+    return 0;
 }
