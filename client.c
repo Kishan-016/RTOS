@@ -1,133 +1,95 @@
-#include <arpa/inet.h>
-#include <fcntl.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
-#include <pthread.h>
-#include <stdbool.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h> 
+#include <pthread.h>
 #include <signal.h>
 
-// struct for requests to join group.
-// used by client to tell the server which group it wants to join.
+void sigintHandler(int sig_num) 
+{ 
+    printf("Are you sure want to exit(y/n)");
+    if(getchar()=='y') exit(1);
+} 
 
-struct JoinRequest {
-    char groupName[20];
-    char name[20];
-};
-// once the server accepts the client's request, it returns with the
-// id of the client and the group id it assigned to it.
-struct JoinResponse {
-    int id;
-    int groupId;
-};
-// once groups are assigned, there is normal chat exchange happening.
-// this is done by sending the following msg sequence.
-struct Message {
-    int id;
-    int groupId;
-    char name[20];
-    char message[200];
-};
-
-struct sockaddr_in serv;  // socket variable
-int fd;                   // socket descripter
-int conn;                 // connection descripter
-struct Message message;
-// send function
-void *send_func(void *n) {
-    int sd = *(int *)n;
-    while (1) {
-        printf("Enter message: ");
-        fgets(message.message, sizeof(message.message), stdin);
-        write(sd, &message, sizeof(message));
-    }
-
-    return 0;
+void *recvmg(void *sock)
+{
+	int rcv_sock = *((int *)sock);
+	char msg[2000],put_msg[2000];
+    int msgtype;
+	int len;
+	while((len = recv(rcv_sock,msg,sizeof(msg),0))>0) {
+        strcpy(put_msg,msg);
+        recv(rcv_sock,&msgtype,sizeof(msgtype),0);
+        recv(rcv_sock,msg,sizeof(msg),0);
+        if( ntohl(msgtype) == 1){
+            printf("%s: %s\n",msg,put_msg);}
+        else {
+            printf("Hey you have a direct message from %s: %s\n", msg, put_msg);
+        }
+	}
 }
-// recieve function
-void *recv_func(void *n) {
-    int rsd = *(int *)n;
-    struct Message message;
 
-    while (read(rsd, &message, sizeof(message))) {
-        printf("%s: %s \n", message.name, message.message);
-    }
+int main(int argc, char const *argv[]) 
+{ 
+	int sock = 0;
+	pthread_t sendt,recvt;
+	struct sockaddr_in serv_addr; 
+	char msg[2000] ={0};  
+	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) 
+	{ 
+		printf("\n Socket creation error \n"); 
+		return -1; 
+	} 
 
-    return 0;
-}
-// signal handler for ctrl + C
-void signal_handler(int n) {
-    char ans;
-    exit(0);
+	serv_addr.sin_family = AF_INET; 
+	serv_addr.sin_port = htons(atoi(argv[1])); 
+	// Convert IPv4 and IPv6 addresses from text to binary form 
+	if(inet_pton(AF_INET, argv[2], &serv_addr.sin_addr)<=0) 
+	{ 
+		printf("\nInvalid address/ Address not supported \n"); 
+		return -1; 
+	} 
 
-    if (n == SIGINT) {
-        printf("exit Y/N\n");
-        scanf("%c", &ans);
-        if (ans == 'y' || ans == 'Y') {
-            printf("The client exited gracefully\n");
+	if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) 
+	{ 
+		printf("\nConnection Failed \n"); 
+		return -1; 
+	}
+    else
+	    printf("You are Online\n");
 
-            exit(0);
+    char name[25],recipient_name[25];
+    strcpy(name,argv[3]);
+    int option;
+    send(sock ,name, sizeof(name),0);
+
+	signal(SIGINT, sigintHandler); 
+	pthread_create(&recvt,NULL,recvmg,&sock);
+	while(1){
+
+        printf("Enter the message to be sent: \n");
+	    fgets(msg, sizeof(msg), stdin); 
+	    send(sock ,msg, sizeof(msg),0);
+	    
+        printf("Enter '1' for group chat and '0' for direct message: ");
+        scanf("%d%*c",&option);
+        option = htonl(option);
+        //printf("%d",ntohl(option));
+        send(sock ,&option, sizeof(option),0);
+
+        if(ntohl(option) == 0)
+        {   
+            printf("Please enter the recipient name\n");
+            scanf("%[^\n]%*c", recipient_name);
+            send(sock ,recipient_name, sizeof(recipient_name),0);
         }
     }
-}
-// main function.
-int main(int argc, char const *argv[]) {
-    signal(SIGINT, signal_handler);  // to catch SIGINT and exit gracefully.
-    pthread_t thread;
-    // take from input argv
-    const char *clientname = argv[4];  // name of the client
-    printf("%s\n", clientname);
-    const char *clientgroup =
-        argv[5];  // group which the clien wants to add to.
-    printf("%s\n", clientgroup);
-    struct JoinRequest request;
-    strcpy(request.name, clientname);
-    strcpy(request.groupName, clientgroup);
-
-    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        printf("\n Socket creation error \n");
-        return -1;
-    }
-    printf("socket created\n");
-    // fd = socket(AF_INET, SOCK_STREAM, 0);
-    serv.sin_family = AF_INET;
-    int port_no = atoi(argv[3]);
-    printf("%d\n", port_no);
-    serv.sin_port = htons(port_no);
-    printf("%s\n", argv[2]);
-    if (inet_pton(AF_INET, argv[2], &serv.sin_addr) <= 0) {
-        printf("\nInvalid address/ Address not supported \n");
-        return -1;
-    }
-    // inet_pton(AF_INET, argv[2], &serv.sin_addr); //binding client to local
-    // host connect(fd, (struct sockaddr *)&serv, sizeof(serv));
-    if (connect(fd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
-        printf("\nConnection Failed \n");
-        return -1;
-    }
-
-    write(fd, &request, sizeof(request));
-    struct JoinResponse response;
-    read(fd, &response, sizeof(response));
-
-    int connectionId = response.id;
-    printf("connectionId = %d\n", connectionId);
-    int group_Id = response.groupId;
-    printf("%d %d\n", connectionId, group_Id);
-    if (pthread_create(&thread, NULL, recv_func, (void *)&fd) < 0) {
-        perror("pthread_create()");
-        exit(EXIT_FAILURE);
-    }
-    message.id = connectionId;
-    message.groupId = group_Id;
-    strcpy(message.name, clientname);
-
-    pthread_create(&thread, NULL, send_func, (void *)&fd);
-    pthread_join(thread, NULL);
-
-    return 0;
-}
+	pthread_join(recvt,NULL);
+	return 0; 
+} 
